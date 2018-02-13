@@ -1,3 +1,4 @@
+import math
 import numpy as np
 
 """
@@ -6,8 +7,9 @@ import numpy as np
 """
 def fix_center_affine(mat, shape):
     mat = mat.astype(float)
-    center = float(shape - 1) / 2
-    mat[1:3, 4] = -mat[1:3, 1:3] * center
+    center = (np.array(shape).astype(float) - 1) / 2
+    mat[0:3, 3] = center - mat[0:3, 0:3].dot(center[np.newaxis].T).T
+    return mat
 
 """
     Randomly generates a 3D affine map based on the parameters given. Then 
@@ -30,8 +32,8 @@ def fix_center_affine(mat, shape):
 
     All transforms fix the center of the image, except for translation.
 """
-def cuda_affine_augment3d(data_iter, data_seg=None, rand_seed=None, 
-    rotMax=(0, 0, 0), pReflect=(0, 0, 0), shearMax=(0,0,0), transMax=(0,0,0), 
+def cuda_affine_augment3d(im, seg=None, rand_seed=None, 
+    rotMax=(0, 0, 0), pReflect=(0, 0, 0), shearMax=(1,1,1), transMax=(0,0,0), 
     otherScale=0):
 
     # Import the required package
@@ -44,62 +46,66 @@ def cuda_affine_augment3d(data_iter, data_seg=None, rand_seed=None,
     # ---Randomly generate the desired transforms, in homogeneous coordinates---
 
     # Uniform rotation
-    rotate_deg = np.random.uniform(low=-rotMax, hi=rotMax, size=(3, 1))
+    rotate_deg = np.random.uniform(low=-np.array(rotMax), high=rotMax)
     lin_rotate = np.identity(3)
     for i in range(3): # Rotate about each axis and combine
-        # Compute the amount of rotation, in radians
-        deg = np.random.uniform(low=-rotMax[i], hi=rotMax[i])
+        # Compute the angle of rotation, in radians
+        deg = np.random.uniform(low=-rotMax[i], high=rotMax[i])
         rad = deg * 2 * math.pi / 360
 
         # Form the rotation matrix about this axis
         rot = np.identity(3)
-        axes = [1, 2, 3].remove(i)
-        rot[axes[1], axes[1]] = cos(rotRad)
-        rot[axes[1], axes[2]] = -sin(rotRad)
-        rot[axes[2], axes[1]] = -rot[axes[1], axes[2]]
-        rot[axes[2], axes[2]] = rot[axes[1], axes[1]]
+        axes = [x for x in range(3) if x != i]
+        rot[axes[0], axes[0]] = math.cos(rad)
+        rot[axes[0], axes[1]] = -math.sin(rad)
+        rot[axes[1], axes[0]] = -rot[axes[0], axes[1]]
+        rot[axes[1], axes[1]] = rot[axes[0], axes[0]]
 
         # Compose all the rotations
-        lin_rotate = lin_rotate * rot
+        lin_rotate = lin_rotate.dot(rot)
 
     # Extend the linear rotation to an affine transform
     mat_rotate = np.identity(4)
-    mat_rotate[1:3, 1:3] = lin_rotate
-    mat_rotate = fix_center_affine(mat_rotate)
+    mat_rotate[0:3, 0:3] = lin_rotate
+    mat_rotate = fix_center_affine(mat_rotate, im.shape)
 
-    # Uniform shear
-    shear = np.random.uniform(low=-max(shearMax, 0.9), hi=shearMax, size=(3, 1))
-    mat_shear = fix_center_affine(np.diag(np.hstack(1 + shear, 1)))
+    # Uniform shear, same chance of shrinking and growing
+    if np.any(shearMax <= 0):
+        raise ValueError("Invalid shearMax: %f" % (shear))    
+    shear = np.random.uniform(low=1.0, high=shearMax, size=3)
+    invert_shear = np.random.uniform(size=3) < 0.5
+    shear[invert_shear] = 1.0 / shear[invert_shear]
+    mat_shear = fix_center_affine(np.diag(np.hstack((shear, 1))), im.shape)
 
     # Reflection
-    do_reflect = np.random.uniform(size=(1,3)) < pReflect
-    mat_reflect = fix_center_affine(np.diag(np.hstack(1 - 2 * do_reflect, 1)))
+    do_reflect = np.random.uniform(size=3) < pReflect
+    mat_reflect = fix_center_affine(np.diag(np.hstack((1 - 2 * do_reflect, 1))),
+        im.shape)
 
     # Generic affine transform, Gaussian-distributed
     mat_other = np.identity(4)
-    mat_other[1:3, :] = mat_other[1:3, :] + \
-        np.random.normal(loc=0.0,scale=otherScale, size=(3,4))
-    mat_other = fix_center_affine(mat_other) 
+    mat_other[0:3, :] = mat_other[0:3, :] + \
+        np.random.normal(loc=0.0, scale=otherScale, size=(3,4))
+    mat_other = fix_center_affine(mat_other, im.shape) 
 
     # Uniform translation
     mat_translate = np.identity(4)
-    mat_translate[1:3, 4] = np.random.uniform(low=-transMax, hi=transMax, 
-        size=(3, 1))
+    mat_translate[0:3, 3] = np.random.uniform(low=-np.array(transMax), 
+        high=transMax)
 
     # Compose all the transforms
     warp_affine = (
-        mat_translate * mat_rotate * mat_shear * mat_reflect * mat_other
-    )[1:3, :]
+        mat_translate.dot( mat_rotate.dot( mat_shear.dot( mat_reflect.dot(
+                mat_other))))
+    )[0:3, :]
 
     # Warp the image
-    data_iter_warp = cudaImageWarp.cudaImageWarp(data_iter, warp_affine, 
-        interp='linear')
+    im_warp = cudaImageWarp.cudaImageWarp(im, warp_affine, interp='linear')
 
     # Return early if there's no segmentation
-    if data_seg is None:
-        return data_iter_warp
+    if seg is None:
+        return im_warp
 
     # Warp the segmentation
-    data_seg_warp = cudaImageWarp.cudaImageWarp(data_seg, warp_affine,
-        interp='nearest')
-    return data_iter_warp, data_seg_warp
+    seg_warp = cudaImageWarp.cudaImageWarp(seg, warp_affine, interp='nearest')
+    return im_warp, seg_warp

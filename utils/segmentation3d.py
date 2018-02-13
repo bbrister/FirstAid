@@ -371,7 +371,7 @@ class segmentor:
             self.sess.run(self.init)
         # Training
         self.super_print("Let's start the training!")
-        loss_min = 1000000
+        loss_min = float("inf")
         for iter in range(self.iter_count):
             loss_temp = self.train_one_iter(iter)
             loss_tr += loss_temp / self.print_every
@@ -388,7 +388,7 @@ class segmentor:
                     loss_val, iou_val = self.test_all(self.opts.path_validation)
                     statement += " Loss_val: " + str(loss_val)
                     statement += " IOU_val: " + str(iou_val)
-                    if loss_val < loss_min:
+                    if loss_val < loss_min: # Only saves the best model found
                         loss_min = loss_val
                         self.saver.save(self.sess, self.opts.path_model)
                 self.super_print(statement)
